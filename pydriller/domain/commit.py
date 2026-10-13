@@ -33,6 +33,7 @@ from git.objects import Commit as GitCommit
 from git.objects.base import IndexObject
 
 from pydriller.domain.developer import Developer
+from pydriller.utils.gitattributes import GitAttributes
 
 logger = logging.getLogger(__name__)
 
@@ -560,6 +561,7 @@ class Commit:
         self._c_object = commit
         self._conf = conf
         self._stats_cache = None
+        self._attributes_reader: Optional[GitAttributes] = None
 
     def __hash__(self) -> int:
         """
@@ -870,6 +872,95 @@ class Commit:
             )
 
         return modified_files_list
+
+    def modified_files_matching_attributes(
+            self, attributes: Dict[str, Any]) -> List[ModifiedFile]:
+        """
+        Return an independent view of :func:`modified_files` containing only
+        the files that satisfy the given gitattributes conditions *as
+        declared in the tree of this very commit*. Historical rules are
+        used, so a file that is marked as generated or vendored only in a
+        later commit is not filtered in here when analyzing older commits.
+
+        This never removes files from :func:`modified_files`, nor does it
+        affect :func:`insertions`, :func:`deletions`, :func:`lines` and
+        :func:`files`, which always keep representing the whole changeset.
+
+        Conditions are expressed as a dictionary mapping attribute names to
+        their expected state:
+
+        * ``True``: the attribute is set (``foo``)
+        * ``False``: the attribute is unset (``-foo``)
+        * a string: the attribute equals that value (``foo=bar``)
+        * ``None``: the attribute is unspecified (``!foo`` or no matching
+          rule at all)
+
+        All the conditions must hold. For deleted files the old path is
+        used, otherwise the new path is used.
+
+        :param Dict attributes: attribute name -> expected state
+        :return: List[ModifiedFile] matching the conditions (a subset,
+            never the same list object as :func:`modified_files`)
+        """
+        c_git = self._conf.get('git')
+        matched = []
+        for mod in self.modified_files:
+            path = mod.new_path if mod.new_path is not None else mod.old_path
+            if path is None:
+                continue
+            actual = self._get_attributes(path, c_git)
+            if self._attributes_match(actual, attributes):
+                matched.append(mod)
+        return matched
+
+    def _get_attributes(self, path: str, c_git: Any) -> Dict[str, Any]:
+        # During a traversal the shared Git object (with its cross-commit
+        # cache) is available. Commits consumed after the traversal ended
+        # (e.g. collected in a list) lose that object, but the underlying
+        # GitPython commit still references its repository: build a reader
+        # on top of it, still reading historical tree blobs only.
+        if c_git is not None:
+            return c_git.get_attributes(self.hash, path)
+        if self._attributes_reader is None:
+            self._attributes_reader = GitAttributes(self._c_object.repo)
+        return self._attributes_reader.get_attributes(self.hash, path)
+
+    @staticmethod
+    def _attributes_match(actual: Dict[str, Any],
+                          expected: Dict[str, Any]) -> bool:
+        for name, wanted in expected.items():
+            if wanted is None:
+                if name in actual:
+                    return False
+            elif actual.get(name) != wanted:
+                return False
+        return True
+
+    @property
+    def generated_files(self) -> List[ModifiedFile]:
+        """
+        Independent analysis view of :func:`modified_files` with only the
+        files marked as ``linguist-generated`` by the .gitattributes rules
+        in effect at this commit. :func:`modified_files` and the commit
+        statistics still represent the complete changeset.
+
+        :return: List[ModifiedFile] generated files in this commit
+        """
+        return self.modified_files_matching_attributes(
+            {"linguist-generated": True})
+
+    @property
+    def vendored_files(self) -> List[ModifiedFile]:
+        """
+        Independent analysis view of :func:`modified_files` with only the
+        files marked as ``linguist-vendored`` by the .gitattributes rules
+        in effect at this commit. :func:`modified_files` and the commit
+        statistics still represent the complete changeset.
+
+        :return: List[ModifiedFile] vendored files in this commit
+        """
+        return self.modified_files_matching_attributes(
+            {"linguist-vendored": True})
 
     @property
     def in_main_branch(self) -> bool:

@@ -19,13 +19,14 @@ This module includes 1 class, Git, representing a repository in Git.
 import logging
 import os
 from pathlib import Path
-from typing import List, Dict, Optional, Set, Generator
+from typing import Any, List, Dict, Optional, Set, Union, Generator
 
 from git import Repo, GitCommandError
 from git.objects import Commit as GitCommit
 
 from pydriller.domain.commit import Commit, ModificationType, ModifiedFile
 from pydriller.utils.conf import Conf
+from pydriller.utils.gitattributes import GitAttributes
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,9 @@ class Git:
 
         self._conf = conf
         self._conf.set_value("main_branch", None)  # init main_branch to None
+
+        # Lazily initialized historical .gitattributes reader
+        self._attributes_reader: Optional[GitAttributes] = None
 
         # Initialize repository
         self._open_repository()
@@ -339,6 +343,35 @@ class Git:
             logger.debug(f"Could not find information of file {path}")
 
         return commits
+
+    def get_attributes(self, commit_id: str, path: Union[str, os.PathLike]) -> Dict[str, Any]:
+        """
+        Get the gitattributes of a path *as defined at a specific commit*.
+
+        The attributes are read from the ``.gitattributes`` files stored in
+        the tree of ``commit_id``. The working tree and the index are never
+        consulted, so the rules of the past are not overwritten by the
+        rules of today (e.g. a file marked as ``linguist-generated`` or
+        ``linguist-vendored`` only in a later commit is not classified as
+        such for older commits).
+
+        The returned dictionary maps attribute names to:
+
+        * ``True`` if the attribute is set (``foo``)
+        * ``False`` if it is unset (``-foo``)
+        * a string if it is set to a value (``foo=bar``)
+
+        Unspecified attributes are omitted from the dictionary.
+
+        :param str commit_id: hash of the commit whose tree provides the
+            .gitattributes rules
+        :param path: repository-relative path of the file to classify
+        :return: Dictionary of the attributes in effect for the path at
+            ``commit_id``
+        """
+        if self._attributes_reader is None:
+            self._attributes_reader = GitAttributes(self.repo)
+        return self._attributes_reader.get_attributes(commit_id, path)
 
     def __del__(self):
         self.clear()

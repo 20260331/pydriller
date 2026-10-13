@@ -20,6 +20,8 @@ A Commit object has all the information of a Git commit, and much more. More spe
 * **in_main_branch** *(Bool)*: True if the commit is in the main branch
 * **merge** *(Bool)*: True if the commit is a merge commit
 * **modified_files** *(List[ModifiedFile])*: list of modified files in the commit (see :ref:`modifiedfile_toplevel`)
+* **generated_files** *(List[ModifiedFile])*: independent view of **modified_files** containing only files marked as ``linguist-generated`` by the .gitattributes rules in effect at this commit (**modified_files** and the statistics below are not filtered)
+* **vendored_files** *(List[ModifiedFile])*: independent view of **modified_files** containing only files marked as ``linguist-vendored`` by the .gitattributes rules in effect at this commit (**modified_files** and the statistics below are not filtered)
 * **parents** *(List[str])*: list of the commit parents
 * **project_name** *(str)*: project name
 * **project_path** *(str)*: project path
