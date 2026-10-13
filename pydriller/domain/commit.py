@@ -33,6 +33,7 @@ from git.objects import Commit as GitCommit
 from git.objects.base import IndexObject
 
 from pydriller.domain.developer import Developer
+from pydriller.domain.line_mapping import LineMapping
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,7 @@ class ModifiedFile:
         self._token_count = None
         self._function_list: List[Method] = []
         self._function_list_before: List[Method] = []
+        self._line_mapping: Optional[LineMapping] = None
 
     def __hash__(self) -> int:
         """
@@ -411,6 +413,43 @@ class ModifiedFile:
         )
         additions_line_number = int(numbers_new_file.split(",")[0]) - 1
         return delete_line_number, additions_line_number
+
+    @property
+    def line_mapping(self) -> LineMapping:
+        """
+        Return the bidirectional mapping between the line numbers of
+        the old and the new version of the file, built from the diff.
+
+        Unlike diff_parsed, which only reports added and deleted lines,
+        the mapping also aligns the unchanged regions (including those
+        outside the hunks), so an old line number can be located in the
+        new file and vice versa. Lines belonging to a changed region do
+        not have a definite counterpart and map to None.
+
+        Mappings of adjacent versions can be chained with
+        :func:`pydriller.domain.line_mapping.LineMapping.compose`.
+
+        :return: LineMapping
+        """
+        if self._line_mapping is None:
+            old_count = LineMapping._count_lines(self.content_before)
+            new_count = LineMapping._count_lines(self.content)
+            # GitPython does not populate the blobs of a 100% rename,
+            # and such a diff is empty because the content is identical:
+            # the mapping is the identity even though the length is not
+            # known.
+            if (
+                self._c_diff.renamed_file
+                and old_count == 0
+                and new_count == 0
+                and not self.diff.strip()
+            ):
+                self._line_mapping = LineMapping._open_identity()
+            else:
+                self._line_mapping = LineMapping(
+                    self.diff, old_count, new_count
+                )
+        return self._line_mapping
 
     @property
     def methods(self) -> List[Method]:

@@ -12,6 +12,14 @@ You can get a list of modified files as well as their diffs and current source c
 * **change_type**: type of the change: can be Added, Deleted, Modified, or Renamed. If you use `change_type.name` you get `ADD`, `DELETE`, `MODIFY`, `RENAME`.
 * **diff**: diff of the file as Git presents it (e.g., starting with @@ xx,xx @@).
 * **diff_parsed**: diff parsed in a dictionary containing the added and deleted lines. The dictionary has 2 keys: “added” and “deleted”, each containing a list of Tuple (int, str) corresponding to (number of line in the file, actual line).
+* **line_mapping**: bidirectional mapping between the line numbers of the old and the new version of the file (a :class:`~pydriller.domain.line_mapping.LineMapping`). Unlike diff_parsed, it also aligns the unchanged regions, so a line can be located in the other version even when hunks before it add or remove lines:
+
+    * ``line_mapping.old_to_new(line)`` and ``line_mapping.new_to_old(line)`` return the corresponding 1-based line number, or ``None`` if the line belongs to a changed (added/deleted) region. They raise ``ValueError`` if the line number does not exist.
+    * ``line_mapping.map_old_range(start, end)`` and ``line_mapping.map_new_range(start, end)`` map an inclusive range to the maximal contiguous inclusive ranges in the other version covered by unchanged lines (a list of ``(start, end)`` tuples, possibly empty).
+    * ``line_mapping.blocks`` lists the aligned regions (equal, deleted, inserted) as :class:`~pydriller.domain.line_mapping.DiffBlock` objects.
+    * mappings of adjacent versions can be chained: ``m12.compose(m23)`` returns the mapping from v1 to v3. A line is mapped across the chain only if it survived unchanged through every change.
+
+    For a pure rename the content is identical, so the mapping is the identity; in that single case Git does not expose the blobs and ``line_mapping.old_lines`` / ``line_mapping.new_lines`` are ``None``.
 * **added_lines**: number of lines added
 * **deleted_lines**: number of lines removed
 * **source_code**: source code of the file (can be ``None`` if the file is deleted or only renamed)

@@ -47,6 +47,15 @@ Developer
    :special-members:
    :exclude-members: __dict__, __weakref__, __eq__, __str__, __hash__
 
+Line mapping
+----------------
+
+.. automodule:: pydriller.domain.line_mapping
+   :members:
+   :undoc-members:
+   :special-members:
+   :exclude-members: __dict__, __weakref__, __eq__, __str__, __hash__
+
 Process Metrics
 ----------------
 
