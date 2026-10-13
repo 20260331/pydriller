@@ -25,12 +25,14 @@ import concurrent.futures
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import List, Generator, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 from git import Repo
+from git.exc import GitError
 
 from pydriller.domain.commit import Commit
 from pydriller.git import Git
+from pydriller.selection import ResumeCursor, SelectionPlan, SelectionPlanError
 from pydriller.utils.conf import Conf
 
 logger = logging.getLogger(__name__)
@@ -61,7 +63,9 @@ class Repository:
                  skip_whitespaces: bool = False,
                  clone_repo_to: Optional[str] = None,
                  order: Optional[str] = None,
-                 use_mailmap: bool = False):
+                 use_mailmap: bool = False,
+                 selection_plan: Optional[Union[str, os.PathLike, SelectionPlan]] = None,
+                 resume_cursor: Optional[Union[str, os.PathLike, ResumeCursor]] = None):
         """
         Init a repository. The only required parameter is
         "path_to_repo": to analyze a single repo, pass the absolute path to
@@ -107,6 +111,17 @@ class Repository:
             'author-date-order', 'topo-order', or 'reverse'. If order=None, PyDriller returns the commits from the oldest to the newest.
         :param bool use_mailmap: Map names and emails of authors and committers to canonical values when a .mailmap file is present in
             the repository.
+        :param selection_plan: fixed selection plan for the traversal. It can be a
+            :class:`~pydriller.selection.SelectionPlan` object or a path to a JSON
+            plan file. If the file does not exist, the ordered commits selected now
+            are saved there; if it exists, the traversal resumes from that exact
+            plan and never silently switches to a newer history. Only supported
+            when analyzing a single repository.
+        :param resume_cursor: resume cursor tracking how many planned commits were
+            already delivered. It can be a :class:`~pydriller.selection.ResumeCursor`
+            object or a path to a JSON cursor file. If omitted while ``selection_plan``
+            is a path, the cursor is stored next to the plan as
+            ``<plan>.cursor.json``.
         """
         file_modification_set = (
             None if only_modifications_with_file_types is None
@@ -145,7 +160,10 @@ class Repository:
             "histogram": histogram_diff,
             "clone_repo_to": clone_repo_to,
             "order": order,
-            "use_mailmap": use_mailmap
+            "use_mailmap": use_mailmap,
+            "selection_plan": selection_plan,
+            "resume_cursor": resume_cursor,
+            "active_resume_cursor": None
         }
         self._conf = Conf(options)
 
@@ -216,42 +234,241 @@ class Repository:
         """
         Analyze all the specified commits (all of them by default), returning
         a generator of commits.
+
+        If a selection plan is configured, the traversal does not re-read the
+        live history: it replays the exact ordered commits stored in the plan
+        and advances the resume cursor only for the commits actually
+        delivered. Branches moving while the traversal runs therefore cannot
+        silently change what gets analyzed.
         """
+        if self._conf.get('selection_plan') is not None \
+                and len(self._conf.get('path_to_repos')) != 1:
+            raise SelectionPlanError(
+                "A selection plan is bound to a single repository history: it "
+                "cannot be shared across multiple repositories"
+            )
+        if self._conf.get('selection_plan') is None \
+                and self._conf.get('resume_cursor') is not None:
+            raise Exception(
+                "A resume cursor requires a selection_plan: the cursor is "
+                "meaningless without the fixed selection it points to"
+            )
+
         for path_repo in self._conf.get('path_to_repos'):
             with self._prep_repo(path_repo=path_repo) as git:
                 logger.info(f'Analyzing git repository in {git.path}')
 
-                # Get the commits that modified the filepath. In this case, we can not use
-                # git rev-list since it doesn't have the option --follow, necessary to follow
-                # the renames. Hence, we manually call git log instead
-                if self._conf.get('filepath') is not None:
-                    self._conf.set_value(
-                        'filepath_commits',
-                        git.get_commits_modified_file(self._conf.get('filepath'),
-                                                      self._conf.get('include_deleted_files'))
-                    )
+                saved_plan = self._load_existing_selection_plan(
+                    self._conf.get('selection_plan')
+                )
 
-                # Gets only the commits that are tagged
-                if self._conf.get('only_releases'):
-                    self._conf.set_value('tagged_commits', git.get_tagged_commits())
+                rev: Optional[Union[str, List[str]]]
+                kwargs: Dict[str, Any]
+                if saved_plan is not None:
+                    # Resume mode: keep the filter inputs frozen in the plan
+                    # instead of recomputing them from the (possibly moved)
+                    # current history.
+                    self._restore_frozen_filters(saved_plan)
+                    rev, kwargs = None, {}
+                else:
+                    # Get the commits that modified the filepath. In this case, we can not use
+                    # git rev-list since it doesn't have the option --follow, necessary to follow
+                    # the renames. Hence, we manually call git log instead
+                    if self._conf.get('filepath') is not None:
+                        self._conf.set_value(
+                            'filepath_commits',
+                            git.get_commits_modified_file(self._conf.get('filepath'),
+                                                          self._conf.get('include_deleted_files'))
+                        )
 
-                # Build the arguments to pass to git rev-list.
-                rev, kwargs = self._conf.build_args()
+                    # Gets only the commits that are tagged
+                    if self._conf.get('only_releases'):
+                        self._conf.set_value('tagged_commits', git.get_tagged_commits())
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=self._conf.get("num_workers")) as executor:
-                    for job in executor.map(self._iter_commits, git.get_list_commits(rev, **kwargs)):
+                    # Build the arguments to pass to git rev-list.
+                    rev, kwargs = self._conf.build_args()
 
-                        for commit in job:
-                            yield commit
+                plan, cursor = self._prepare_checkpoint(git, saved_plan, rev, kwargs)
+
+                if plan is not None and cursor is not None:
+                    commits_to_analyze: Generator[Commit, None, None] = \
+                        self._iter_planned_commits(git, plan, cursor)
+                else:
+                    commits_to_analyze = git.get_list_commits(rev, **kwargs)
+
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=self._conf.get("num_workers")) as executor:
+                        for job in executor.map(self._iter_commits, commits_to_analyze):
+
+                            for commit in job:
+                                yield commit
+                finally:
+                    # The traversal of this repository finished (or the
+                    # consumer stopped iterating): detach the cursor so the
+                    # Repository can be reused without stale checkpoint state.
+                    self._conf.set_value("active_resume_cursor", None)
+
+    @staticmethod
+    def _load_existing_selection_plan(
+        selection_plan: Optional[Union[str, os.PathLike, SelectionPlan]]
+    ) -> Optional[SelectionPlan]:
+        """
+        Return the plan to resume from, or None if a new plan has to be built.
+        Paths pointing to a non-existing file mean "build and save here".
+        """
+        if selection_plan is None:
+            return None
+        if isinstance(selection_plan, SelectionPlan):
+            return selection_plan
+        if isinstance(selection_plan, (str, os.PathLike)):
+            plan_path = Path(selection_plan)
+            if plan_path.exists():
+                return SelectionPlan.load(plan_path)
+            return None
+        raise Exception(
+            "selection_plan has to be a SelectionPlan, a path, or None"
+        )
+
+    def _restore_frozen_filters(self, plan: SelectionPlan) -> None:
+        if plan.filepath_commits is not None:
+            self._conf.set_value('filepath_commits', set(plan.filepath_commits))
+        if plan.tagged_commits is not None:
+            self._conf.set_value('tagged_commits', set(plan.tagged_commits))
+
+    def _prepare_checkpoint(
+        self,
+        git: Git,
+        saved_plan: Optional[SelectionPlan],
+        rev: Optional[Union[str, List[str]]],
+        kwargs: Dict,
+    ) -> Tuple[Optional[SelectionPlan], Optional[ResumeCursor]]:
+        """
+        Resolve the plan and the cursor to use while analyzing the current
+        repository. Returns (None, None) when checkpointing is disabled.
+        """
+        selection_plan_arg = self._conf.get('selection_plan')
+        if selection_plan_arg is None:
+            return None, None
+
+        plan_path = self._checkpoint_file_path(selection_plan_arg)
+
+        if saved_plan is None:
+            # First run: freeze the selection as it is *now*.
+            selected_hashes = [commit.hash
+                               for commit in git.get_list_commits(rev, **kwargs)]
+            plan = SelectionPlan(
+                selected_hashes,
+                repo=str(git.path),
+                head=self._get_head_hash(git),
+                tagged_commits=self._conf.get('tagged_commits'),
+                filepath_commits=self._conf.get('filepath_commits'),
+            )
+            if plan_path is not None:
+                plan.save(plan_path)
+        else:
+            plan = saved_plan
+
+        # A plan is only replayable while all of its commits still exist in
+        # the object store. If some disappeared, fail loudly instead of
+        # falling back to the new history.
+        missing = plan.missing_commits(git.objects_exist(plan.commits))
+        if missing:
+            preview = ", ".join(missing[:5])
+            raise SelectionPlanError(
+                f"{len(missing)} of {len(plan)} planned commits do not exist "
+                f"anymore in the repository (first missing: {preview}). The "
+                "history changed since the selection plan was created; "
+                "refusing to silently traverse the new history. Build a new "
+                "plan explicitly to analyze the current history."
+            )
+
+        cursor = self._prepare_cursor(plan, plan_path)
+        self._conf.set_value("active_resume_cursor", cursor)
+        return plan, cursor
+
+    def _prepare_cursor(
+        self,
+        plan: SelectionPlan,
+        plan_path: Optional[Path],
+    ) -> ResumeCursor:
+        resume_cursor_arg = self._conf.get('resume_cursor')
+
+        if isinstance(resume_cursor_arg, ResumeCursor):
+            resume_cursor_arg.bind(plan)
+            return resume_cursor_arg
+
+        if resume_cursor_arg is None:
+            if plan_path is None:
+                # In-memory plan passed directly: the cursor cannot survive
+                # the process, but the traversal still follows the plan.
+                return ResumeCursor(plan)
+            # By default, persist the cursor next to the plan.
+            cursor_path = plan_path.with_name(plan_path.stem + ".cursor.json")
+        elif isinstance(resume_cursor_arg, (str, os.PathLike)):
+            cursor_path = Path(resume_cursor_arg)
+        else:
+            raise Exception(
+                "resume_cursor has to be a ResumeCursor, a path, or None"
+            )
+
+        if cursor_path.exists():
+            return ResumeCursor.load(cursor_path, plan)
+
+        cursor = ResumeCursor(plan)
+        cursor.save(cursor_path)
+        return cursor
+
+    @staticmethod
+    def _checkpoint_file_path(
+        selection_plan: Union[str, os.PathLike, SelectionPlan]
+    ) -> Optional[Path]:
+        if isinstance(selection_plan, SelectionPlan):
+            return None
+        return Path(selection_plan)
+
+    @staticmethod
+    def _get_head_hash(git: Git) -> Optional[str]:
+        try:
+            return git.repo.head.commit.hexsha
+        except (ValueError, GitError, TypeError):
+            # Empty repository or detached/unreadable HEAD: nothing to record.
+            logger.debug("Could not read HEAD while building the selection plan")
+            return None
+
+    def _iter_planned_commits(
+        self,
+        git: Git,
+        plan: SelectionPlan,
+        cursor: ResumeCursor,
+    ) -> Generator[Commit, None, None]:
+        """
+        Yield the planned commits in the exact order stored in the plan,
+        skipping the commits the cursor already accounts for. Commit objects
+        are looked up by hash, so moved branches are ignored.
+        """
+        for index, commit_hash in enumerate(plan.commits):
+            if cursor.is_pending(index, commit_hash):
+                yield git.get_commit(commit_hash)
 
     def _iter_commits(self, commit: Commit) -> Generator[Commit, None, None]:
         logger.info(f'Commit #{commit.hash} in {commit.committer_date} from {commit.author.name}')
 
+        cursor = self._conf.get("active_resume_cursor")
+
         if self._conf.is_commit_filtered(commit):
             logger.info(f'Commit #{commit.hash} filtered')
+            if cursor is not None:
+                # Deterministic skip: the planned item was processed and can
+                # never be delivered, so advance past it.
+                cursor.mark_delivered(commit.hash)
             return
 
         yield commit
+
+        if cursor is not None:
+            # Acknowledge only after the consumer actually received the
+            # commit, so a crash before delivery makes the item replayed.
+            cursor.mark_delivered(commit.hash)
 
     @staticmethod
     def _split_in_chunks(full_list: List[Commit], num_workers: int) -> List[List[Commit]]:

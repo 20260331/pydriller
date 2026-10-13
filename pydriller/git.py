@@ -18,8 +18,9 @@ This module includes 1 class, Git, representing a repository in Git.
 
 import logging
 import os
+import tempfile
 from pathlib import Path
-from typing import List, Dict, Optional, Set, Generator
+from typing import List, Dict, Iterable, Optional, Set, Generator
 
 from git import Repo, GitCommandError
 from git.objects import Commit as GitCommit
@@ -136,6 +137,60 @@ class Git:
         """
         gp_commit = self.repo.commit(commit_id)
         return Commit(gp_commit, self._conf)
+
+    def objects_exist(self, hashes: Iterable[str]) -> Set[str]:
+        """
+        Return the subset of ``hashes`` that still exist in the Git object
+        store. The check runs in a single ``git cat-file --batch-check``
+        call and does not depend on branches or HEAD, so it can verify a
+        saved selection plan even after branches moved.
+
+        :param hashes: object hashes to verify (typically full commit hashes)
+        :return: the hashes that exist in the repository
+        """
+        hash_list = list(hashes)
+        if not hash_list:
+            return set()
+
+        # GitPython requires istream to back a real file descriptor, hence
+        # the temporary file instead of an in-memory BytesIO.
+        stream = tempfile.NamedTemporaryFile(
+            mode="wb", prefix="pydriller-cat-file-", suffix=".txt", delete=False
+        )
+        try:
+            stream.write(("\n".join(hash_list) + "\n").encode("utf-8"))
+            stream.flush()
+            stream.close()
+            with open(stream.name, "rb") as input_stream:
+                output = self.repo.git.cat_file(
+                    "--batch-check", istream=input_stream
+                )
+        except (OSError, GitCommandError):
+            return self._objects_exist_one_by_one(hash_list)
+        finally:
+            try:
+                os.unlink(stream.name)
+            except OSError:
+                pass
+
+        existing: Set[str] = set()
+        # git emits one output line per input line, in the same order:
+        # "<hash> <type> <size>" or "<hash> missing"
+        for commit_hash, line in zip(hash_list, output.splitlines()):
+            parts = line.split(" ")
+            if len(parts) >= 2 and parts[1] != "missing":
+                existing.add(commit_hash)
+        return existing
+
+    def _objects_exist_one_by_one(self, hashes: List[str]) -> Set[str]:
+        existing: Set[str] = set()
+        for commit_hash in hashes:
+            try:
+                self.repo.git.rev_parse("--verify", "--quiet", commit_hash)
+            except GitCommandError:
+                continue
+            existing.add(commit_hash)
+        return existing
 
     def get_commit_from_gitpython(self, commit: GitCommit) -> Commit:
         """
