@@ -33,6 +33,14 @@ from git.objects import Commit as GitCommit
 from git.objects.base import IndexObject
 
 from pydriller.domain.developer import Developer
+from pydriller.domain.signature import (
+    MergeTagEnvelope,
+    SignatureEnvelope,
+    SignatureVerifier,
+    VerificationResult,
+    offline_signature_verifier,
+    parse_commit_envelopes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -560,6 +568,9 @@ class Commit:
         self._c_object = commit
         self._conf = conf
         self._stats_cache = None
+        self._raw_commit_cache: Optional[bytes] = None
+        self._signatures_cache: Optional[Tuple[SignatureEnvelope, ...]] = None
+        self._merge_tags_cache: Optional[Tuple[MergeTagEnvelope, ...]] = None
 
     def __hash__(self) -> int:
         """
@@ -704,6 +715,87 @@ class Commit:
         :return: bool merge
         """
         return len(self._c_object.parents) > 1
+
+    @property
+    def raw_commit(self) -> bytes:
+        """
+        Return the raw, uncompressed body of the commit object, exactly as
+        stored in the Git object database (headers, blank line and message).
+
+        This is the only byte-accurate source for signature analysis:
+        GitPython's ``gpgsig`` attribute is re-encoded and newline-stripped,
+        so rebuilding the signed buffer from the formatted Commit attributes
+        does not reproduce the bytes a signature covers.
+
+        :return: bytes raw commit object body
+        """
+        if self._raw_commit_cache is None:
+            self._raw_commit_cache = self._c_object.data_stream.read()
+        assert self._raw_commit_cache is not None
+        return self._raw_commit_cache
+
+    def _parse_signatures(self) -> None:
+        if self._signatures_cache is None or self._merge_tags_cache is None:
+            signatures, merge_tags = parse_commit_envelopes(self.raw_commit)
+            self._signatures_cache = signatures
+            self._merge_tags_cache = merge_tags
+
+    @property
+    def signatures(self) -> Tuple[SignatureEnvelope, ...]:
+        """
+        Return the detached signatures attached directly to this commit
+        through ``gpgsig`` (or ``gpgsig-sha256``) headers. Most commits have
+        zero or one; each envelope preserves the exact signed payload (the
+        raw commit body with the signature header block removed) and parses
+        OpenPGP/SSH packet metadata offline, without gpg, keys or network.
+
+        :return: tuple of SignatureEnvelope, in header order
+        """
+        self._parse_signatures()
+        assert self._signatures_cache is not None
+        return self._signatures_cache
+
+    @property
+    def merge_tags(self) -> Tuple[MergeTagEnvelope, ...]:
+        """
+        Return the embedded tag objects carried by ``mergetag`` headers
+        (produced by signed merges). Each unfolded tag body is preserved
+        byte for byte, including any signature covering the embedded tag.
+
+        :return: tuple of MergeTagEnvelope, in header order
+        """
+        self._parse_signatures()
+        assert self._merge_tags_cache is not None
+        return self._merge_tags_cache
+
+    def verify_signatures(
+            self,
+            verifier: Optional[SignatureVerifier] = None
+    ) -> List[VerificationResult]:
+        """
+        Verify every signature of this commit, including the signatures
+        embedded in ``mergetag`` headers.
+
+        By default the keyless, offline :class:`OfflineSignatureVerifier`
+        is used: it never invokes gpg/ssh-keygen, never reads a keyring and
+        never accesses the network, it only reports structural inspection.
+        Pass a custom :class:`SignatureVerifier` to plug in real
+        cryptographic verification.
+
+        :param verifier: verifier implementation; None for offline inspection
+        :return: one VerificationResult per signature envelope
+        """
+        if verifier is None:
+            verifier = offline_signature_verifier
+
+        results = [verifier.verify(signature)
+                   for signature in self.signatures]
+        for merge_tag in self.merge_tags:
+            results.extend(
+                verifier.verify(signature)
+                for signature in merge_tag.signatures
+            )
+        return results
 
     def _stats(self):
         if self._stats_cache is not None:

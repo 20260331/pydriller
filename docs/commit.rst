@@ -30,6 +30,10 @@ A Commit object has all the information of a Git commit, and much more. More spe
 * **dmm_unit_size** *(float)*: DMM metric value for the unit size property.
 * **dmm_unit_complexity** *(float)*: DMM metric value for the unit complexity property.
 * **dmm_unit_interfacing** *(float)*: DMM metric value for the unit interfacing property.
+* **raw_commit** *(bytes)*: raw, uncompressed body of the commit object as stored in the Git object database
+* **signatures** *(Tuple[SignatureEnvelope])*: detached ``gpgsig`` signatures of the commit; each envelope keeps the byte-exact signed payload and offline OpenPGP/SSH metadata
+* **merge_tags** *(Tuple[MergeTagEnvelope])*: tag objects embedded in ``mergetag`` headers (signed merges), including their nested signatures
+* **verify_signatures** *(List[VerificationResult])*: verify the commit and merge-tag signatures; by default a keyless, offline verifier is used, but any custom ``SignatureVerifier`` can be plugged in
 
 
 Example::
