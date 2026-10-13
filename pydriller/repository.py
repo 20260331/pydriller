@@ -61,7 +61,8 @@ class Repository:
                  skip_whitespaces: bool = False,
                  clone_repo_to: Optional[str] = None,
                  order: Optional[str] = None,
-                 use_mailmap: bool = False):
+                 use_mailmap: bool = False,
+                 notes_ref: Optional[Union[str, List[str]]] = None):
         """
         Init a repository. The only required parameter is
         "path_to_repo": to analyze a single repo, pass the absolute path to
@@ -107,6 +108,13 @@ class Repository:
             'author-date-order', 'topo-order', or 'reverse'. If order=None, PyDriller returns the commits from the oldest to the newest.
         :param bool use_mailmap: Map names and emails of authors and committers to canonical values when a .mailmap file is present in
             the repository.
+        :param notes_ref: the ref (or list of refs) where Git notes are stored
+            (e.g. "refs/notes/commits" or the short form "commits"). When set,
+            each commit exposes the notes annotating it via `commit.notes`.
+            The refs are resolved and pinned to their object SHA when the
+            traversal starts, so moving a notes ref while a traversal is in
+            progress does not change the notes seen by its commits. If None,
+            notes are not loaded.
         """
         file_modification_set = (
             None if only_modifications_with_file_types is None
@@ -116,6 +124,16 @@ class Repository:
             None if only_commits is None
             else set(only_commits)
             )
+
+        notes_refs: List[str]
+        if notes_ref is None:
+            notes_refs = []
+        elif isinstance(notes_ref, str):
+            notes_refs = [notes_ref]
+        else:
+            notes_refs = list(notes_ref)
+        # remove duplicates while keeping the user-provided order
+        notes_refs = list(dict.fromkeys(notes_refs))
 
         options = {
             "git": None,
@@ -145,7 +163,9 @@ class Repository:
             "histogram": histogram_diff,
             "clone_repo_to": clone_repo_to,
             "order": order,
-            "use_mailmap": use_mailmap
+            "use_mailmap": use_mailmap,
+            "notes_refs": notes_refs,
+            "notes_snapshot": None
         }
         self._conf = Conf(options)
 

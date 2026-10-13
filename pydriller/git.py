@@ -18,11 +18,12 @@ This module includes 1 class, Git, representing a repository in Git.
 
 import logging
 import os
+import string
 from pathlib import Path
-from typing import List, Dict, Optional, Set, Generator
+from typing import List, Dict, Optional, Set, Generator, Tuple
 
 from git import Repo, GitCommandError
-from git.objects import Commit as GitCommit
+from git.objects import Commit as GitCommit, Blob, Tree
 
 from pydriller.domain.commit import Commit, ModificationType, ModifiedFile
 from pydriller.utils.conf import Conf
@@ -59,6 +60,11 @@ class Git:
 
         # Initialize repository
         self._open_repository()
+
+        # Pin the configured notes refs to their current object version and
+        # load their notes. This runs when a traversal starts, hence a notes
+        # ref moving later on does not affect the commits of this traversal.
+        self._prepare_notes_snapshot()
 
     @property
     def repo(self) -> Repo:
@@ -339,6 +345,98 @@ class Git:
             logger.debug(f"Could not find information of file {path}")
 
         return commits
+
+    def _prepare_notes_snapshot(self) -> None:
+        """
+        Resolve each configured notes ref, pin it to its current object SHA
+        and load all the notes reachable from that object.
+
+        The snapshot is stored in the configuration as a dictionary mapping
+        each notes ref to a dictionary {annotated object SHA: note text}.
+        Since notes are content-addressed and the ref is resolved once,
+        moving the ref after this snapshot is built cannot change the notes
+        seen by the commits of the ongoing traversal.
+        """
+        notes_refs = self._conf.get("notes_refs") or []
+        snapshot: Dict[str, Dict[str, str]] = {}
+
+        for notes_ref in notes_refs:
+            resolved_ref = self._resolve_notes_ref(notes_ref)
+            if resolved_ref is None:
+                logger.warning(f"Notes ref {notes_ref} not found in {self.path}, "
+                               "no notes will be loaded from it")
+                continue
+
+            pinned_sha = self.repo.git.rev_parse(resolved_ref)
+            logger.debug(f"Pinning notes ref {resolved_ref} at {pinned_sha}")
+            snapshot[resolved_ref] = self._read_notes_at(pinned_sha)
+
+        self._conf.set_value("notes_snapshot", snapshot)
+
+    def _resolve_notes_ref(self, notes_ref: str) -> Optional[str]:
+        """
+        Resolve a notes ref provided by the user to its full ref name.
+
+        The ref is accepted as-is if it exists, otherwise it is looked up
+        under "refs/notes/" (e.g. "commits" becomes "refs/notes/commits"),
+        mirroring the behavior of "git notes --ref".
+
+        :param str notes_ref: notes ref as provided by the user
+        :return: the full ref name, or None if the ref does not exist
+        """
+        try:
+            self.repo.git.rev_parse('--verify', notes_ref)
+            return notes_ref
+        except GitCommandError:
+            pass
+
+        short_ref = notes_ref
+        prefix = "refs/notes/"
+        if short_ref.startswith(prefix):
+            short_ref = short_ref[len(prefix):]
+        candidate = prefix + short_ref
+
+        try:
+            self.repo.git.rev_parse('--verify', candidate)
+            return candidate
+        except GitCommandError:
+            return None
+
+    def _read_notes_at(self, notes_commit_sha: str) -> Dict[str, str]:
+        """
+        Load all the notes of the notes commit object identified by
+        `notes_commit_sha`, returning a dictionary mapping the SHA of each
+        annotated object to the text of its note.
+
+        Notes can be stored at the root of the notes tree or in fan-out
+        subdirectories (e.g. "ab/cdef..."); the components of the path are
+        joined to reconstruct the annotated object SHA.
+
+        :param str notes_commit_sha: SHA of the (pinned) notes commit
+        :return: dictionary {annotated object SHA: note text}
+        """
+        notes: Dict[str, str] = {}
+        notes_commit = self.repo.commit(notes_commit_sha)
+
+        for annotated_sha, blob in self._iter_note_blobs(notes_commit.tree):
+            notes[annotated_sha] = blob.data_stream.read().decode("utf-8", "ignore")
+
+        return notes
+
+    @classmethod
+    def _iter_note_blobs(cls, tree: Tree, prefix: str = "") -> Generator[Tuple[str, Blob], None, None]:
+        """
+        Recursively iterate over the note blobs of a notes tree, pairing
+        each blob with the SHA of the object it annotates.
+        """
+        for item in tree:
+            entry_path = prefix + item.name
+            if isinstance(item, Tree):
+                yield from cls._iter_note_blobs(item, entry_path)
+            elif isinstance(item, Blob):
+                annotated_sha = entry_path.replace("/", "")
+                if len(annotated_sha) == 40 and all(c in string.hexdigits for c in annotated_sha):
+                    yield annotated_sha.lower(), item
 
     def __del__(self):
         self.clear()

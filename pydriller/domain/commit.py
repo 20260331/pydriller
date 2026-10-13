@@ -912,6 +912,43 @@ class Commit:
         }
 
     @property
+    def notes(self) -> Dict[str, str]:
+        """
+        Return the Git notes annotating this commit, as a dictionary mapping
+        each configured notes ref to the text of its note. Refs that do not
+        annotate the commit are not included, so the dictionary is empty when
+        the commit has no notes (or when no notes ref was configured on the
+        Repository).
+
+        The notes come from the snapshot pinned when the traversal started:
+        moving a notes ref while the traversal is in progress does not change
+        the value returned here.
+
+        :return: dict(str, str) mapping notes ref to note text
+        """
+        snapshot = self._conf.get("notes_snapshot") or {}
+        return {
+            notes_ref: notes[self.hash]
+            for notes_ref, notes in snapshot.items()
+            if self.hash in notes
+        }
+
+    @property
+    def note(self) -> Optional[str]:
+        """
+        Return the text of the note annotating this commit from the first
+        configured notes ref that contains one, or None if no configured
+        ref annotates the commit.
+
+        As for `notes`, the value is taken from the snapshot pinned when the
+        traversal started.
+
+        :return: str note text, or None
+        """
+        notes = self.notes
+        return next(iter(notes.values()), None)
+
+    @property
     def dmm_unit_size(self) -> Optional[float]:
         """
         Return the Delta Maintainability Model (DMM) metric value for the unit size property.
